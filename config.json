@@ -1,0 +1,20 @@
+{
+  "created_at": "2026-11-01T10:27:42",
+  "seed": 42,
+  "test_size": 0.2,
+  "MIN_ITEM_CF": 10,
+  "MIN_USER_CF": 3,
+  "K_NEIGHBORS": 30,
+  "SHRINK": 10,
+  "REG_BIAS": 10,
+  "DAMP": 1.0,
+  "TOP_K": 10,
+  "REL_THRESHOLD": 8,
+  "PRUNE_TOPN": null,
+  "n_train": 346937,
+  "n_test": 86734,
+  "n_users": 68208,
+  "n_books": 158815,
+  "n_cf_items": 4330,
+  "global_mean": 7.600916016452555
+}

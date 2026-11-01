@@ -17,29 +17,98 @@ class Recommender:
         self.cfg = json.load(open(f"{art_dir}/config.json", encoding="utf-8"))
         with open(f"{art_dir}/model_state.pkl", "rb") as f:
             st = pickle.load(f)
-        self.mu = st["mu"]
-        self.b_i, self.b_u = st["b_i"], st["b_u"]
-        self.user_cnt, self.item_cnt = st["user_cnt"], st["item_cnt"]
-        self.cf_items, self.item_ix = st["cf_items"], st["item_ix"]
-        self.user_hist = st["user_hist"]
-        self.auth_d, self.pub_d = st["auth_d"], st["pub_d"]
-        self.pop_rank, self.pop_score = st["pop_rank"], st["pop_score"]
-        self.author_items = st["author_items"]
+        self.cf_items = st["cf_items"]                      # urutan baris/kolom matriks S
+        self.item_ix = {i: k for k, i in enumerate(self.cf_items)}
         self.item_arr = np.array(self.cf_items)
-
         self.S = sparse.load_npz(f"{art_dir}/similarity.npz").tocsr()
         self.books = pd.read_csv(f"{art_dir}/books.csv.gz", dtype=str,
                                  keep_default_na=False).set_index("ISBN")
-        self.history = pd.read_csv(f"{art_dir}/user_history.csv.gz",
-                                   dtype={"User-ID": int, "ISBN": str, "Book-Rating": int})
-        self.seen = self.history.groupby("User-ID")["ISBN"].apply(set).to_dict()
+        hist = pd.read_csv(f"{art_dir}/user_history.csv.gz",
+                           dtype={"User-ID": int, "ISBN": str, "Book-Rating": int})
+        self.history = hist.sort_values("User-ID", kind="stable").reset_index(drop=True)
         self._search = (self.books["Book-Title"] + " " + self.books["Book-Author"]).str.lower()
+        self._b_author = self.books["Book-Author"].to_numpy()
+        self._b_index = self.books.index.to_numpy()
 
         self.min_user_cf = self.cfg["MIN_USER_CF"]
         self.min_item_cf = self.cfg["MIN_ITEM_CF"]
         self.k_nb = self.cfg["K_NEIGHBORS"]
         self.damp = self.cfg["DAMP"]
         self.rel = self.cfg["REL_THRESHOLD"]
+        self._build_stats()
+
+    def _build_stats(self):
+        """Hitung ulang bias, residual, popularitas dari riwayat train (identik dengan skrip pelatihan)."""
+        h, reg = self.history, self.cfg["REG_BIAS"]
+        rating = h["Book-Rating"].to_numpy().astype(float)
+        self.mu = float(rating.mean())
+        g = h.groupby("ISBN")["Book-Rating"].agg(["sum", "count"])
+        b_i = (g["sum"] - self.mu * g["count"]) / (g["count"] + reg)
+        bi_row = h["ISBN"].map(b_i).to_numpy()
+        gu = pd.Series(rating - self.mu - bi_row).groupby(h["User-ID"].to_numpy()).agg(["sum", "count"])
+        b_u = gu["sum"] / (gu["count"] + reg)
+        bu_row = h["User-ID"].map(b_u).to_numpy()
+        self._res = rating - (self.mu + bi_row + bu_row)    # residual terhadap baseline
+
+        self.b_i, self.b_u = b_i.to_dict(), b_u.to_dict()
+        self.item_cnt = g["count"].astype(int).to_dict()
+        self.user_cnt = gu["count"].astype(int).to_dict()
+
+        cnt, sm = g["count"], g["sum"]
+        pool = cnt[cnt >= 3].index
+        score = ((sm[pool] + self.mu * 5) / (cnt[pool] + 5)).to_dict()
+        ctd = cnt.to_dict()
+        self.pop_score = score
+        self.pop_rank = sorted(score, key=lambda i: (-score[i], -ctd[i]))[:2000]
+
+        self._hu = h["User-ID"].to_numpy()
+        self._hi = h["ISBN"].to_numpy()
+        self._hr = h["Book-Rating"].to_numpy()
+        self.cf_users = set(h.loc[h["ISBN"].isin(self.item_ix), "User-ID"].unique().tolist())
+        self._sig = {}
+
+    # ---- akses riwayat per user (tanpa menyimpan dict besar) ----
+    def _span(self, u):
+        return (int(np.searchsorted(self._hu, u, "left")), int(np.searchsorted(self._hu, u, "right")))
+
+    def _seen(self, u):
+        lo, hi = self._span(u)
+        return set(self._hi[lo:hi])
+
+    def _cf_hist(self, u):
+        lo, hi = self._span(u)
+        isb = self._hi[lo:hi]
+        ix = np.fromiter((self.item_ix.get(i, -1) for i in isb), dtype=np.int64, count=len(isb))
+        m = ix >= 0
+        if not m.any():
+            return None
+        return (ix[m].astype(np.int32), self._res[lo:hi][m].astype(np.float32),
+                self._hr[lo:hi][m].astype(np.float32))
+
+    def _signals(self, u):
+        """Rata-rata residual user per penulis / penerbit (Content-Based), dihitung per user."""
+        if u in self._sig:
+            return self._sig[u]
+        if len(self._sig) > 5000:
+            self._sig.clear()
+        lo, hi = self._span(u)
+        isb, res = self._hi[lo:hi], self._res[lo:hi]
+        au = self.books["Book-Author"].reindex(isb).fillna("").to_numpy()
+        pu = self.books["Publisher"].reindex(isb).fillna("").to_numpy()
+        auth, pub = {}, {}
+        for x, y, r in zip(au, pu, res):
+            if x:
+                s0, c0 = auth.get(x, (0.0, 0)); auth[x] = (s0 + r, c0 + 1)
+            if y:
+                s0, c0 = pub.get(y, (0.0, 0)); pub[y] = (s0 + r, c0 + 1)
+        self._sig[u] = (auth, pub)
+        return self._sig[u]
+
+    def _author_items(self, a, n=5):
+        idx = np.flatnonzero(self._b_author == a)
+        isb = self._b_index[idx]
+        cnts = np.array([self.item_cnt.get(i, 0) for i in isb])
+        return list(isb[np.argsort(-cnts, kind="stable")][:n])
 
     # ------------------------------------------------------------------ util
     def baseline(self, u, i):
@@ -62,9 +131,12 @@ class Recommender:
 
     # ------------------------------------------------------------ prediksi
     def _cf_core(self, u, i):
-        if i not in self.item_ix or u not in self.user_hist:
+        if i not in self.item_ix:
             return None
-        js, res, _ = self.user_hist[u]
+        hist = self._cf_hist(u)
+        if hist is None:
+            return None
+        js, res, _ = hist
         row = self.S.getrow(self.item_ix[i]).toarray().ravel()
         s = row[js]
         pos = s > 0
@@ -78,10 +150,11 @@ class Recommender:
         return p, s, res, js
 
     def _cb(self, u, i, author, pub):
-        for d, key in ((self.auth_d, (u, author)), (self.pub_d, (u, pub))):
-            if key[1] and key in d:
-                s, c = d[key]
-                return self.baseline(u, i) + (s / c) * (c / (c + 2.0)), key
+        auth, pubd = self._signals(u)
+        for kind, d, key in (("a", auth, author), ("p", pubd, pub)):
+            if key and key in d:
+                s, n = d[key]
+                return self.baseline(u, i) + (s / n) * (n / (n + 2.0)), kind, key
         return None
 
     def predict(self, u, i, author=None, pub=None):
@@ -113,10 +186,10 @@ class Recommender:
         if uc > 0:
             r = self._cb(u, i, author, pub)
             if r is not None:
-                p, key = r
-                what = "penulis" if key[1] == author else "penerbit"
+                p, kind, key = r
+                what = "penulis" if kind == "a" else "penerbit"
                 out.update(pred=float(np.clip(p, 1, 10)), route="Content",
-                           note=f"Baseline + kecenderungan user pada {what} yang sama: '{key[1]}'.")
+                           note=f"Baseline + kecenderungan user pada {what} yang sama: '{key}'.")
                 return out
         out.update(pred=out["baseline"], route="Rule/Baseline",
                    note="Tidak ada sinyal CF/Content -> memakai baseline (rata-rata global + bias user + bias buku).")
@@ -124,7 +197,7 @@ class Recommender:
 
     # ------------------------------------------------------- top-K rekomendasi
     def _rec_pop(self, u):
-        seen = self.seen.get(u, set())
+        seen = self._seen(u)
         return [i for i in self.pop_rank if i not in seen]
 
     def _score_cf(self, js, w, seen, k):
@@ -150,15 +223,18 @@ class Recommender:
         return out[:k]
 
     def _rec_cf(self, u, k):
-        js, _, rating = self.user_hist[u]
-        return self._score_cf(js, rating / 10.0, self.seen.get(u, set()), k)
+        js, _, rating = self._cf_hist(u)
+        return self._score_cf(js, rating / 10.0, self._seen(u), k)
 
     def _rec_content(self, u, k):
-        h = self.history[(self.history["User-ID"] == u) & (self.history["Book-Rating"] >= self.rel)]
-        seen, have, out = self.seen.get(u, set()), set(), []
-        for i in h["ISBN"]:
+        lo, hi = self._span(u)
+        liked = self._hi[lo:hi][self._hr[lo:hi] >= self.rel]
+        seen, have, out = self._seen(u), set(), []
+        for i in liked:
             a = self.books["Book-Author"].get(i, "")
-            for j in self.author_items.get(a, [])[:5]:
+            if not a:
+                continue
+            for j in self._author_items(a, 5):
                 if j not in seen and j not in have:
                     out.append((j, 0.0, f"Penulis sama dengan '{self.title(i)}'"))
                     have.add(j)
@@ -177,7 +253,7 @@ class Recommender:
     def recommend(self, u, k=10):
         """Return (DataFrame rekomendasi, route yang dipakai)."""
         uc = self.user_cnt.get(u, 0)
-        if uc >= self.min_user_cf and u in self.user_hist:
+        if uc >= self.min_user_cf and u in self.cf_users:
             items, route = self._rec_cf(u, k), "CF"
         elif uc > 0:
             items, route = self._rec_content(u, k), "Content"

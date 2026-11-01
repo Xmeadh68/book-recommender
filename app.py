@@ -113,7 +113,7 @@ def show_recs(df, key, reason=True):
 @st.cache_data
 def example_users():
     rng = np.random.default_rng(7)
-    warm = [u for u, c in rec.user_cnt.items() if c >= rec.min_user_cf and u in rec.user_hist]
+    warm = [u for u, c in rec.user_cnt.items() if c >= rec.min_user_cf and u in rec.cf_users]
     few = [u for u, c in rec.user_cnt.items() if 0 < c < rec.min_user_cf]
     pick = lambda xs: sorted(int(x) for x in rng.choice(xs, min(40, len(xs)), replace=False)) if xs else []
     return {
