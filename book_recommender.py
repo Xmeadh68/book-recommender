@@ -366,34 +366,17 @@ sparse.save_npz(f"{ART_DIR}/similarity.npz", S_sp, compressed=True)
 log(f"similarity.npz  nnz={S_sp.nnz:,}  ({_size(ART_DIR + '/similarity.npz')})")
 del S_art
 
-# --- 8b. State model ---
-user_hist_art = {}
-for u, g in cf_tr.groupby("User-ID"):
-    user_hist_art[int(u)] = (g["ISBN"].map(item_ix).values.astype(np.int32),
-                             g["_res"].values.astype(np.float32),
-                             g["Book-Rating"].values.astype(np.float32))
-
-model_state = {
-    "mu": float(mu),
-    "b_i": {k: float(v) for k, v in b_i.items()},
-    "b_u": {int(k): float(v) for k, v in b_u.items()},
-    "user_cnt": {int(k): int(v) for k, v in user_cnt.items()},
-    "item_cnt": {k: int(v) for k, v in item_cnt.items()},
-    "cf_items": list(cf_items),                 # urutan = indeks baris/kolom S
-    "item_ix": dict(item_ix),
-    "user_hist": user_hist_art,                 # u -> (idx_item, residual, rating)
-    "auth_d": {(int(k[0]), k[1]): (float(s), int(c)) for k, (s, c) in auth_d.items()},
-    "pub_d": {(int(k[0]), k[1]): (float(s), int(c)) for k, (s, c) in pub_d.items()},
-    "pop_rank": list(pop_rank),
-    "pop_score": {i: float(v) for i, v in pop_score.items()},
-    "author_items": {a: v[:20] for a, v in author_items.items()},
-}
+# --- 8b. State model (sengaja kecil) ---
+# Bias user/buku, riwayat CF, tabel penulis/penerbit & popularitas TIDAK disimpan di sini:
+# semuanya dihitung ulang saat dashboard dimuat dari user_history.csv.gz (lihat recommender_core.py).
+# Yang wajib disimpan hanya urutan buku pada matriks kemiripan.
+model_state = {"mu": float(mu), "cf_items": list(cf_items)}
 with open(f"{ART_DIR}/model_state.pkl", "wb") as f:
     pickle.dump(model_state, f, protocol=pickle.HIGHEST_PROTOCOL)
 log(f"model_state.pkl ({_size(ART_DIR + '/model_state.pkl')})")
 
 # --- 8c. Metadata buku (hanya yang muncul di train) + riwayat rating user ---
-img_cols = [c for c in ["Image-URL-S", "Image-URL-M", "Image-URL-L"] if c in books.columns]
+img_cols = [c for c in ["Image-URL-M"] if c in books.columns]   # dashboard hanya memakai ukuran M
 book_cols = ["ISBN", "Book-Title", "Book-Author", "Publisher"]
 if "Year-Of-Publication" in books.columns:
     book_cols.append("Year-Of-Publication")
